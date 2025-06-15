@@ -2,122 +2,124 @@
 
 set -e
 
-echo "🔧 Backhaul Installer / Uninstaller"
 echo "-----------------------------------"
 read -p "Do you want to install or uninstall backhaul? (install/uninstall): " ACTION
-ACTION=$(echo "$ACTION" | tr '[:upper:]' '[:lower:]')
 
 if [[ "$ACTION" == "uninstall" ]]; then
-    echo "🗑 Uninstalling Backhaul..."
-    sudo systemctl stop backhaul || true
-    sudo systemctl disable backhaul || true
-    sudo rm -f /etc/systemd/system/backhaul.service
-    sudo rm -f /usr/local/bin/backhaul
-    sudo rm -rf /etc/backhaul
-    sudo rm -rf /var/log/backhaul
-    sudo userdel backhaul 2>/dev/null || true
-    sudo systemctl daemon-reload
-    echo "✅ Backhaul completely uninstalled."
-    exit 0
-fi
-
-if [[ "$ACTION" != "install" ]]; then
-    echo "❌ Invalid action. Exiting."
-    exit 1
+  echo "🧹 Uninstalling Backhaul..."
+  sudo systemctl stop backhaul || true
+  sudo systemctl disable backhaul || true
+  sudo rm -f /etc/systemd/system/backhaul.service
+  sudo rm -f /etc/backhaul/config.toml
+  sudo rm -f /usr/local/bin/backhaul
+  echo "✅ Backhaul has been removed."
+  exit 0
+elif [[ "$ACTION" != "install" ]]; then
+  echo "❌ Invalid option. Use 'install' or 'uninstall'."
+  exit 1
 fi
 
 echo "📦 Installing Backhaul..."
 
-# Create user and directory
-sudo useradd -r -s /bin/false backhaul 2>/dev/null || true
-sudo mkdir -p /etc/backhaul
-sudo mkdir -p /var/log/backhaul
-sudo chown backhaul: /etc/backhaul /var/log/backhaul
+# Ensure dependencies
+sudo apt update
+sudo apt install -y curl tar
+
+# Ask user for role
+read -p "Choose role (server/client): " ROLE
+if [[ "$ROLE" != "server" && "$ROLE" != "client" ]]; then
+  echo "❌ Invalid role. Must be 'server' or 'client'."
+  exit 1
+fi
+
+read -p "Enter bind/remote address (e.g., 0.0.0.0:3080): " ADDRESS
+read -p "Enter token (shared between server and client): " TOKEN
+read -p "Enter web panel port (e.g., 2060): " WEB_PORT
+read -p "Enter path for sniffer log (e.g., /root/backhaul.json): " LOG_PATH
+read -p "Enter log level (info/debug/warn/error): " LOG_LEVEL
+
+# If server, ask for port forwards
+FORWARD_PORTS=""
+if [[ "$ROLE" == "server" ]]; then
+  read -p "Enter ports to forward (e.g., 443=443,5566=9766). Leave blank for none: " FORWARD_PORTS
+fi
 
 # Download latest release
 cd /tmp
-LATEST=$(curl -s https://api.github.com/repos/Musixal/Backhaul/releases/latest | grep browser_download_url | grep linux_amd64 | cut -d '"' -f 4)
-curl -L "$LATEST" -o backhaul.zip
-unzip backhaul.zip -d backhaul_bin
+LATEST=$(curl -s https://api.github.com/repos/Musixal/Backhaul/releases/latest \
+  | grep browser_download_url \
+  | grep linux_amd64.tar.gz \
+  | cut -d '"' -f 4)
+
+echo "⬇ Downloading: $LATEST"
+curl -L "$LATEST" -o backhaul.tar.gz
+mkdir -p backhaul_bin
+tar -xzf backhaul.tar.gz -C backhaul_bin
 sudo mv backhaul_bin/backhaul /usr/local/bin/backhaul
 sudo chmod +x /usr/local/bin/backhaul
 
-# === Ask for user input ===
-read -p "Select role (server/client): " ROLE
-ROLE=$(echo "$ROLE" | tr '[:upper:]' '[:lower:]')
+# Create config directory
+sudo mkdir -p /etc/backhaul
 
-read -p "Enter transport (e.g. tcp, ws, wss, kcp): " TRANSPORT
-read -p "Enter shared token: " TOKEN
-read -p "Enter port to listen on (server) or connect to (client): " PORT
-
+# Generate config.toml
 CONFIG_PATH="/etc/backhaul/config.toml"
+echo "🛠 Generating config at $CONFIG_PATH"
 
-# Start writing config
-echo "[$ROLE]" > "$CONFIG_PATH"
-echo "transport = \"$TRANSPORT\"" >> "$CONFIG_PATH"
-echo "token = \"$TOKEN\"" >> "$CONFIG_PATH"
-
-if [ "$ROLE" = "server" ]; then
-    echo "bind_addr = \"0.0.0.0:$PORT\"" >> "$CONFIG_PATH"
-    echo "accept_udp = false" >> "$CONFIG_PATH"
-    echo "keepalive_period = 75" >> "$CONFIG_PATH"
-    echo "nodelay = true" >> "$CONFIG_PATH"
-    echo "heartbeat = 40" >> "$CONFIG_PATH"
-    echo "channel_size = 2048" >> "$CONFIG_PATH"
-    echo "sniffer = false" >> "$CONFIG_PATH"
-    echo "web_port = 2060" >> "$CONFIG_PATH"
-    echo "sniffer_log = \"/var/log/backhaul/sniffer.json\"" >> "$CONFIG_PATH"
-    echo "log_level = \"info\"" >> "$CONFIG_PATH"
-
-    # Ask for ports
-    echo "Enter port mappings in format local=remote (e.g. 443=443). Type 'done' when finished:"
-    PORTS=()
-    while true; do
-        read -p "> " MAP
-        [[ "$MAP" == "done" ]] && break
-        PORTS+=("\"$MAP\"")
-    done
-    JOINED=$(IFS=, ; echo "${PORTS[*]}")
-    echo "ports = [$JOINED]" >> "$CONFIG_PATH"
-
+if [[ "$ROLE" == "server" ]]; then
+sudo tee $CONFIG_PATH > /dev/null <<EOF
+[server]
+bind_addr = "$ADDRESS"
+transport = "tcp"
+accept_udp = false
+token = "$TOKEN"
+keepalive_period = 75
+nodelay = true
+heartbeat = 40
+channel_size = 2048
+sniffer = false
+web_port = $WEB_PORT
+sniffer_log = "$LOG_PATH"
+log_level = "$LOG_LEVEL"
+ports = [$(echo "$FORWARD_PORTS" | sed 's/,/","/g' | sed 's/^/"/;s/$/"/')]
+EOF
 else
-    read -p "Enter remote server address (e.g. 1.2.3.4:$PORT): " REMOTE
-    echo "remote_addr = \"$REMOTE\"" >> "$CONFIG_PATH"
-    echo "connection_pool = 8" >> "$CONFIG_PATH"
-    echo "aggressive_pool = false" >> "$CONFIG_PATH"
-    echo "keepalive_period = 75" >> "$CONFIG_PATH"
-    echo "dial_timeout = 10" >> "$CONFIG_PATH"
-    echo "nodelay = true" >> "$CONFIG_PATH"
-    echo "retry_interval = 3" >> "$CONFIG_PATH"
-    echo "sniffer = false" >> "$CONFIG_PATH"
-    echo "web_port = 2060" >> "$CONFIG_PATH"
-    echo "sniffer_log = \"/var/log/backhaul/sniffer.json\"" >> "$CONFIG_PATH"
-    echo "log_level = \"info\"" >> "$CONFIG_PATH"
+sudo tee $CONFIG_PATH > /dev/null <<EOF
+[client]
+remote_addr = "$ADDRESS"
+transport = "tcp"
+token = "$TOKEN"
+connection_pool = 8
+aggressive_pool = false
+keepalive_period = 75
+dial_timeout = 10
+nodelay = true
+retry_interval = 3
+sniffer = false
+web_port = $WEB_PORT
+sniffer_log = "$LOG_PATH"
+log_level = "$LOG_LEVEL"
+EOF
 fi
 
-# === Create systemd service ===
-echo "🔧 Setting up systemd service..."
-
-cat <<EOF | sudo tee /etc/systemd/system/backhaul.service > /dev/null
+# Create systemd service
+sudo tee /etc/systemd/system/backhaul.service > /dev/null <<EOF
 [Unit]
 Description=Backhaul Tunnel
 After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/backhaul -c /etc/backhaul/config.toml
-User=backhaul
 Restart=on-failure
 RestartSec=5
-LimitNOFILE=4096
+User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Enable and start
-sudo systemctl daemon-reexec
+# Reload and enable service
 sudo systemctl daemon-reload
 sudo systemctl enable backhaul
-sudo systemctl start backhaul
+sudo systemctl restart backhaul
 
-echo "✅ Backhaul installed and running as systemd service."
+echo "✅ Backhaul installed and running as a service."
