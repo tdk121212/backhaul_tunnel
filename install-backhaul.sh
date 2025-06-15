@@ -2,93 +2,122 @@
 
 set -e
 
-echo "==== Backhaul Tunnel Installer for Ubuntu ===="
+echo "🔧 Backhaul Installer / Uninstaller"
+echo "-----------------------------------"
+read -p "Do you want to install or uninstall backhaul? (install/uninstall): " ACTION
+ACTION=$(echo "$ACTION" | tr '[:upper:]' '[:lower:]')
 
-# Check if script is run as root
-if [[ "$EUID" -ne 0 ]]; then
-  echo "❌ Please run this script as root (e.g. with sudo)"
-  exit 1
+if [[ "$ACTION" == "uninstall" ]]; then
+    echo "🗑 Uninstalling Backhaul..."
+    sudo systemctl stop backhaul || true
+    sudo systemctl disable backhaul || true
+    sudo rm -f /etc/systemd/system/backhaul.service
+    sudo rm -f /usr/local/bin/backhaul
+    sudo rm -rf /etc/backhaul
+    sudo rm -rf /var/log/backhaul
+    sudo userdel backhaul 2>/dev/null || true
+    sudo systemctl daemon-reload
+    echo "✅ Backhaul completely uninstalled."
+    exit 0
 fi
 
-# Prompt user for setup details
-read -p "Enter the role (server/client): " ROLE
+if [[ "$ACTION" != "install" ]]; then
+    echo "❌ Invalid action. Exiting."
+    exit 1
+fi
+
+echo "📦 Installing Backhaul..."
+
+# Create user and directory
+sudo useradd -r -s /bin/false backhaul 2>/dev/null || true
+sudo mkdir -p /etc/backhaul
+sudo mkdir -p /var/log/backhaul
+sudo chown backhaul: /etc/backhaul /var/log/backhaul
+
+# Download latest release
+cd /tmp
+LATEST=$(curl -s https://api.github.com/repos/Musixal/Backhaul/releases/latest | grep browser_download_url | grep linux_amd64 | cut -d '"' -f 4)
+curl -L "$LATEST" -o backhaul.zip
+unzip backhaul.zip -d backhaul_bin
+sudo mv backhaul_bin/backhaul /usr/local/bin/backhaul
+sudo chmod +x /usr/local/bin/backhaul
+
+# === Ask for user input ===
+read -p "Select role (server/client): " ROLE
 ROLE=$(echo "$ROLE" | tr '[:upper:]' '[:lower:]')
-if [[ "$ROLE" != "server" && "$ROLE" != "client" ]]; then
-  echo "❌ Invalid role. Must be 'server' or 'client'."
-  exit 1
-fi
 
-read -p "Enter the protocol (tcp/ws/wss/udp-tcp): " PROTOCOL
-read -p "Enter the listen port (e.g. 8080): " PORT
-read -p "Enter a name for the systemd service (e.g. backhaul): " SERVICE_NAME
+read -p "Enter transport (e.g. tcp, ws, wss, kcp): " TRANSPORT
+read -p "Enter shared token: " TOKEN
+read -p "Enter port to listen on (server) or connect to (client): " PORT
 
-# Install Go and Git if not already installed
-echo "🔧 Installing dependencies..."
-apt update -y
-apt install -y golang-go git
+CONFIG_PATH="/etc/backhaul/config.toml"
 
-# Set install paths
-INSTALL_DIR="/opt/backhaul"
-BIN_PATH="/usr/local/bin/backhaul"
-CONFIG_DIR="/etc/backhaul"
-SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+# Start writing config
+echo "[$ROLE]" > "$CONFIG_PATH"
+echo "transport = \"$TRANSPORT\"" >> "$CONFIG_PATH"
+echo "token = \"$TOKEN\"" >> "$CONFIG_PATH"
 
-# Clone Backhaul repo
-mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR"
-if [[ -d "Backhaul" ]]; then
-  echo "📦 Updating Backhaul repository..."
-  cd Backhaul && git pull
+if [ "$ROLE" = "server" ]; then
+    echo "bind_addr = \"0.0.0.0:$PORT\"" >> "$CONFIG_PATH"
+    echo "accept_udp = false" >> "$CONFIG_PATH"
+    echo "keepalive_period = 75" >> "$CONFIG_PATH"
+    echo "nodelay = true" >> "$CONFIG_PATH"
+    echo "heartbeat = 40" >> "$CONFIG_PATH"
+    echo "channel_size = 2048" >> "$CONFIG_PATH"
+    echo "sniffer = false" >> "$CONFIG_PATH"
+    echo "web_port = 2060" >> "$CONFIG_PATH"
+    echo "sniffer_log = \"/var/log/backhaul/sniffer.json\"" >> "$CONFIG_PATH"
+    echo "log_level = \"info\"" >> "$CONFIG_PATH"
+
+    # Ask for ports
+    echo "Enter port mappings in format local=remote (e.g. 443=443). Type 'done' when finished:"
+    PORTS=()
+    while true; do
+        read -p "> " MAP
+        [[ "$MAP" == "done" ]] && break
+        PORTS+=("\"$MAP\"")
+    done
+    JOINED=$(IFS=, ; echo "${PORTS[*]}")
+    echo "ports = [$JOINED]" >> "$CONFIG_PATH"
+
 else
-  echo "📥 Cloning Backhaul repository..."
-  git clone https://github.com/Musixal/Backhaul.git
-  cd Backhaul
+    read -p "Enter remote server address (e.g. 1.2.3.4:$PORT): " REMOTE
+    echo "remote_addr = \"$REMOTE\"" >> "$CONFIG_PATH"
+    echo "connection_pool = 8" >> "$CONFIG_PATH"
+    echo "aggressive_pool = false" >> "$CONFIG_PATH"
+    echo "keepalive_period = 75" >> "$CONFIG_PATH"
+    echo "dial_timeout = 10" >> "$CONFIG_PATH"
+    echo "nodelay = true" >> "$CONFIG_PATH"
+    echo "retry_interval = 3" >> "$CONFIG_PATH"
+    echo "sniffer = false" >> "$CONFIG_PATH"
+    echo "web_port = 2060" >> "$CONFIG_PATH"
+    echo "sniffer_log = \"/var/log/backhaul/sniffer.json\"" >> "$CONFIG_PATH"
+    echo "log_level = \"info\"" >> "$CONFIG_PATH"
 fi
 
-# Build the binary
-echo "🔨 Building Backhaul..."
-go build -o "$BIN_PATH" ./cmd
+# === Create systemd service ===
+echo "🔧 Setting up systemd service..."
 
-# Create configuration file
-mkdir -p "$CONFIG_DIR"
-CONFIG_FILE="${CONFIG_DIR}/config.yaml"
-cat > "$CONFIG_FILE" <<EOF
-type: $ROLE
-transport: $PROTOCOL
-listen: :$PORT
-EOF
-
-echo "📝 Config created at: $CONFIG_FILE"
-
-# Create systemd service
-echo "⚙️ Creating systemd service..."
-cat > "$SERVICE_PATH" <<EOF
+cat <<EOF | sudo tee /etc/systemd/system/backhaul.service > /dev/null
 [Unit]
-Description=Backhaul $ROLE Service
+Description=Backhaul Tunnel
 After=network.target
 
 [Service]
-ExecStart=$BIN_PATH -c $CONFIG_FILE
+ExecStart=/usr/local/bin/backhaul -c /etc/backhaul/config.toml
+User=backhaul
 Restart=on-failure
-User=root
-WorkingDirectory=$INSTALL_DIR/Backhaul
+RestartSec=5
+LimitNOFILE=4096
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Enable and start service
-systemctl daemon-reexec
-systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME"
+# Enable and start
+sudo systemctl daemon-reexec
+sudo systemctl daemon-reload
+sudo systemctl enable backhaul
+sudo systemctl start backhaul
 
-# Done
-echo "✅ Installation complete!"
-echo "------------------------------------------"
-echo "🔹 Role      : $ROLE"
-echo "🔹 Protocol  : $PROTOCOL"
-echo "🔹 Port      : $PORT"
-echo "🔹 Config    : $CONFIG_FILE"
-echo "🔹 Service   : $SERVICE_NAME"
-echo "📡 Check service: systemctl status $SERVICE_NAME"
-echo "📄 Logs: journalctl -u $SERVICE_NAME -f"
+echo "✅ Backhaul installed and running as systemd service."
